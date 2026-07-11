@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+*.egg-info/
+
+# OS
+.DS_Store
+
+# Local config (use config.example.yaml as template)
+config.yaml
+
+# Generated / working data
+output/
+work/
+models/
+
+# Logs
+*.log

@@ -1,0 +1,66 @@
+# Copy this to config.yaml (start.sh does this for you automatically) and
+# adjust to taste. See README.md for what each section means.
+
+input_video: raw/my_recording.mov
+work_dir: work
+output_video: output/final_cut.mp4
+
+# How many talk/graphic ranges to process concurrently. Ranges are mostly
+# independent work, so this is the single biggest speed lever — try raising
+# it on a machine with more CPU cores, or lower it if ffmpeg/Ollama start
+# contending too much. Defaults to min(4, cpu count) if omitted.
+parallel_workers: 4
+
+silence:
+  noise_floor_db: -30
+  min_silence_sec: 0.6
+  keep_padding_sec: 0.15
+
+noise_reduction:
+  enabled: true
+  profile_start_sec: 0.0
+  profile_end_sec: 1.0
+
+audio_enhance:
+  highpass_hz: 80
+  presence_boost_db: 3
+  target_lufs: -16
+  limiter_ceiling_db: -1.5
+
+render:
+  width: 1920
+  height: 1080
+  fps: 30
+  video_codec: libx264
+  crf: 18
+  audio_codec: aac
+  audio_bitrate: 192k
+
+pip:
+  width_pct: 0.28
+  position: bottom-right
+  margin_px: 40
+  border_width_px: 6
+
+# Replaces your real webcam background with a single static, themed image
+# for the whole video (talk/full-frame segments only — MediaPipe person
+# segmentation). Off by default since it adds real processing time and a
+# ~250KB model download on first use; set enabled: true to turn it on.
+background:
+  enabled: false
+  accent: "#2dd4bf"
+  feather_px: 9
+  rim_glow_px: 3
+
+# Graphic segments are written by an LLM as animated HTML, then recorded by a
+# headless browser. backend: ollama (free, local, needs `ollama serve` +
+# a pulled model) or anthropic (better quality, needs ANTHROPIC_API_KEY).
+graphics:
+  backend: ollama
+  model: phi3.5
+  ollama_server: http://127.0.0.1:11434
+  timeout_sec: 180
+
+# Auto-filled by plan_segments.py --write (see README step 3), or hand-write
+# your own. Timestamps refer to your ORIGINAL, uncut recording.
+segments: []
