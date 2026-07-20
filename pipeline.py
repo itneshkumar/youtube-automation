@@ -33,6 +33,7 @@ from dotenv import load_dotenv
 import audio_tools
 import background_replace
 import graphics_llm
+import hyperframe_graphics
 import outro
 import pip_overlay
 
@@ -187,17 +188,31 @@ def process_graphic_range(raw_input, rng, work_dir, cfg, mask_png, border_png,
     graphics_cfg = cfg.get("graphics", {})
     duration = rng["end"] - rng["start"]
     transcript_entries = load_transcript_entries_for_range(cfg, rng["start"], rng["end"])
-    graphic_video = graphics_llm.generate_motion_graphic(
-        seg["prompt"], work_dir / "graphic_raw", duration, frame_w, frame_h,
-        transcript_entries=transcript_entries, range_start=rng["start"],
-        pip_position=pip_cfg.get("position", "bottom-right"),
-        backend=graphics_cfg.get("backend", graphics_llm.DEFAULT_BACKEND),
-        model=graphics_cfg.get("model"),
-        llamacpp_server=graphics_llm.DEFAULT_LLAMACPP_SERVER,
-        timeout=graphics_cfg.get("timeout_sec", 180),
-        fps=render_cfg["fps"],
-        max_attempts=graphics_cfg.get("max_attempts", 2),
-    )
+
+    # HYPERFRAME_GRAPHICS in .env overrides config.yaml's
+    # graphics.hyperframe_rendering when set, so a run can switch renderers
+    # without editing config.yaml. graphics_llm.py (the existing
+    # Playwright/CSS template backend) stays the default either way.
+    hyperframe_enabled = env_flag("HYPERFRAME_GRAPHICS", default=graphics_cfg.get("hyperframe_rendering", False))
+    if hyperframe_enabled:
+        graphic_video = hyperframe_graphics.generate_motion_graphic(
+            seg["prompt"], work_dir / "graphic_raw", duration, frame_w, frame_h,
+            transcript_entries=transcript_entries, range_start=rng["start"],
+            pip_position=pip_cfg.get("position", "bottom-right"),
+            fps=render_cfg["fps"],
+        )
+    else:
+        graphic_video = graphics_llm.generate_motion_graphic(
+            seg["prompt"], work_dir / "graphic_raw", duration, frame_w, frame_h,
+            transcript_entries=transcript_entries, range_start=rng["start"],
+            pip_position=pip_cfg.get("position", "bottom-right"),
+            backend=graphics_cfg.get("backend", graphics_llm.DEFAULT_BACKEND),
+            model=graphics_cfg.get("model"),
+            llamacpp_server=graphics_llm.DEFAULT_LLAMACPP_SERVER,
+            timeout=graphics_cfg.get("timeout_sec", 180),
+            fps=render_cfg["fps"],
+            max_attempts=graphics_cfg.get("max_attempts", 2),
+        )
 
     pip_clip = pip_overlay.build_pip_clip(
         raw_input, rng["start"], rng["end"], oval_w, oval_h,

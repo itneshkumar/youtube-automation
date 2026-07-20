@@ -73,6 +73,10 @@ graphics:
   # a failing attempt's problems feed back into the next attempt instead of
   # silently handing the pipeline a bad step list or a truncated clip.
   max_attempts: 2
+  # Alternate renderer (hyperframe_graphics.py, not yet implemented) instead
+  # of the Playwright/CSS templates above. HYPERFRAME_GRAPHICS=true/false in
+  # .env overrides this when set.
+  hyperframe_rendering: false
 
 # Animated "subscribe & like" pop-in, overlaid on the last duration_sec
 # seconds of the final render (doesn't extend the video, just overlays it).
