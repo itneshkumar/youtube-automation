@@ -28,11 +28,30 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import yaml
+from dotenv import load_dotenv
 
 import audio_tools
 import background_replace
 import graphics_llm
+import outro
 import pip_overlay
+
+load_dotenv()
+
+
+def env_flag(name, default=None):
+    """Read a boolean from the environment (.env or shell), e.g. 'true'/'1'/'yes'.
+    Returns `default` if the variable isn't set, so config.yaml can still decide."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def hex_to_rgb(hex_color):
+    """'#a77b00' or 'a77b00' -> (167, 123, 0)."""
+    hex_color = hex_color.lstrip("#")
+    return tuple(int(hex_color[i:i + 2], 16) for i in (0, 2, 4))
 
 
 def hms_to_sec(hms):
@@ -69,8 +88,18 @@ def build_range_plan(duration, segments):
     return plan
 
 
-def process_talk_range(raw_input, start, end, work_dir, cfg, noise_profile_wav=None, background_image=None):
-    """Extract [start,end] from raw_input and run the full audio pipeline on it."""
+def process_talk_range(raw_input, start, end, work_dir, cfg, noise_profile_wav=None,
+                        background_image=None, audio_editing_enabled=True):
+    """
+    Extract [start,end] from raw_input and run the audio pipeline on it.
+
+    When audio_editing_enabled is False (AUDIO_EDITING=false in .env), silence
+    cut / noise reduction / loudness-EQ are all skipped entirely and the raw
+    extracted slice passes through untouched, keeping the original timeline
+    length. Background replacement is independent of this flag (it's a video
+    operation, controlled by BACKGROUND_REMOVE/background.enabled) and still
+    applies to whichever slice is current.
+    """
     work_dir.mkdir(parents=True, exist_ok=True)
     raw_slice = work_dir / "raw_slice.mkv"
     audio_tools.run([
@@ -81,14 +110,17 @@ def process_talk_range(raw_input, start, end, work_dir, cfg, noise_profile_wav=N
         str(raw_slice)
     ])
 
-    silence_cfg = cfg["silence"]
-    cut_path = work_dir / "cut.mkv"
-    audio_tools.cut_silence(
-        raw_slice, cut_path, work_dir / "silence_parts",
-        noise_floor_db=silence_cfg["noise_floor_db"],
-        min_silence_sec=silence_cfg["min_silence_sec"],
-        padding=silence_cfg["keep_padding_sec"],
-    )
+    cur_path = raw_slice
+    if audio_editing_enabled:
+        silence_cfg = cfg["silence"]
+        cut_path = work_dir / "cut.mkv"
+        audio_tools.cut_silence(
+            raw_slice, cut_path, work_dir / "silence_parts",
+            noise_floor_db=silence_cfg["noise_floor_db"],
+            min_silence_sec=silence_cfg["min_silence_sec"],
+            padding=silence_cfg["keep_padding_sec"],
+        )
+        cur_path = cut_path
 
     if background_image is not None:
         bg_path = work_dir / "bg_replaced.mp4"
@@ -96,24 +128,27 @@ def process_talk_range(raw_input, start, end, work_dir, cfg, noise_profile_wav=N
         accent_hex = bg_cfg.get("accent", "#2dd4bf").lstrip("#")
         accent_rgb = tuple(int(accent_hex[i:i + 2], 16) for i in (0, 2, 4))
         background_replace.replace_background(
-            cut_path, bg_path, background_image, work_dir,
+            cur_path, bg_path, background_image, work_dir,
             feather_px=bg_cfg.get("feather_px", 9),
             accent_rgb=accent_rgb,
             rim_glow_px=bg_cfg.get("rim_glow_px", 4),
         )
-        cut_path = bg_path
+        cur_path = bg_path
+
+    if not audio_editing_enabled:
+        return cur_path
 
     nr_cfg = cfg["noise_reduction"]
     denoised_path = work_dir / "denoised.mkv"
     if nr_cfg.get("enabled", True):
         audio_tools.reduce_noise(
-            cut_path, denoised_path, work_dir,
+            cur_path, denoised_path, work_dir,
             noise_profile_wav=noise_profile_wav,
             profile_start_sec=nr_cfg["profile_start_sec"],
             profile_end_sec=nr_cfg["profile_end_sec"],
         )
     else:
-        shutil.copy(cut_path, denoised_path)
+        shutil.copy(cur_path, denoised_path)
 
     ae_cfg = cfg["audio_enhance"]
     enhanced_path = work_dir / "enhanced.mkv"
@@ -138,7 +173,8 @@ def load_transcript_entries_for_range(cfg, start, end):
     return overlapping
 
 
-def process_graphic_range(raw_input, rng, work_dir, cfg, mask_png, border_png, noise_profile_wav=None):
+def process_graphic_range(raw_input, rng, work_dir, cfg, mask_png, border_png,
+                           noise_profile_wav=None, audio_editing_enabled=True):
     """Generate the motion graphic + oval PIP composite for one graphic range."""
     work_dir.mkdir(parents=True, exist_ok=True)
     seg = rng["segment"]
@@ -157,8 +193,10 @@ def process_graphic_range(raw_input, rng, work_dir, cfg, mask_png, border_png, n
         pip_position=pip_cfg.get("position", "bottom-right"),
         backend=graphics_cfg.get("backend", graphics_llm.DEFAULT_BACKEND),
         model=graphics_cfg.get("model"),
-        ollama_server=graphics_cfg.get("ollama_server", graphics_llm.DEFAULT_OLLAMA_SERVER),
+        llamacpp_server=graphics_llm.DEFAULT_LLAMACPP_SERVER,
         timeout=graphics_cfg.get("timeout_sec", 180),
+        fps=render_cfg["fps"],
+        max_attempts=graphics_cfg.get("max_attempts", 2),
     )
 
     pip_clip = pip_overlay.build_pip_clip(
@@ -173,6 +211,9 @@ def process_graphic_range(raw_input, rng, work_dir, cfg, mask_png, border_png, n
         position=pip_cfg["position"], oval_w=oval_w,
         margin_px=pip_cfg["margin_px"],
     )
+
+    if not audio_editing_enabled:
+        return composited
 
     # This range currently carries the RAW (un-enhanced) mic audio under the
     # graphic. Run it through the same noise-reduction + enhancement chain
@@ -200,7 +241,7 @@ def process_graphic_range(raw_input, rng, work_dir, cfg, mask_png, border_png, n
 
 
 def process_range(i, rng, raw_input, work_dir, cfg, mask_png, border_png, print_lock,
-                   noise_profile_wav=None, background_image=None):
+                   noise_profile_wav=None, background_image=None, audio_editing_enabled=True):
     """Process one range (talk or graphic) and return (index, output_path).
     Ranges are independent (each only touches its own range_NN_*/ subfolder
     and reads the shared source video read-only), so this is safe to run
@@ -210,12 +251,15 @@ def process_range(i, rng, raw_input, work_dir, cfg, mask_png, border_png, print_
         with print_lock:
             print(f"[{i}] TALK  {rng['start']:.1f}s - {rng['end']:.1f}s (started)")
         result = process_talk_range(raw_input, rng["start"], rng["end"], rng_dir, cfg,
-                                     noise_profile_wav=noise_profile_wav, background_image=background_image)
+                                     noise_profile_wav=noise_profile_wav, background_image=background_image,
+                                     audio_editing_enabled=audio_editing_enabled)
     else:
         with print_lock:
             print(f"[{i}] GRAPHIC  {rng['start']:.1f}s - {rng['end']:.1f}s : "
                   f"{rng['segment']['prompt'][:60]}... (started)")
-        result = process_graphic_range(raw_input, rng, rng_dir, cfg, mask_png, border_png, noise_profile_wav=noise_profile_wav)
+        result = process_graphic_range(raw_input, rng, rng_dir, cfg, mask_png, border_png,
+                                        noise_profile_wav=noise_profile_wav,
+                                        audio_editing_enabled=audio_editing_enabled)
     with print_lock:
         print(f"[{i}] done")
     return i, result
@@ -244,6 +288,16 @@ def main(config_path):
         border_width=pip_cfg.get("border_width_px", 6),
     )
 
+    # AUDIO_EDITING in .env overrides config.yaml's audio_editing.enabled when
+    # set, so a run can fully bypass silence-cut/noise-reduction/loudness-EQ
+    # (e.g. to inspect raw timing or when the mic audio is already clean)
+    # without editing config.yaml.
+    audio_cfg = cfg.get("audio_editing", {})
+    audio_editing_enabled = env_flag("AUDIO_EDITING", default=audio_cfg.get("enabled", True))
+    if not audio_editing_enabled:
+        print("[pipeline] AUDIO_EDITING is false — skipping silence cut, noise reduction, "
+              "and loudness/EQ; every range's raw audio (and original timing) passes through untouched.\n")
+
     # Extract ONE noise profile from the ORIGINAL recording at the
     # user-configured quiet moment, reused for every range's noise reduction.
     # Sampling per-clip instead (the old behavior) grabs mostly-speech
@@ -252,7 +306,7 @@ def main(config_path):
     # dull/muffled patches. See audio_tools.reduce_noise's docstring.
     nr_cfg = cfg["noise_reduction"]
     noise_profile_wav = None
-    if nr_cfg.get("enabled", True):
+    if audio_editing_enabled and nr_cfg.get("enabled", True):
         noise_profile_wav = work_dir / "noise_profile.wav"
         audio_tools.extract_noise_profile(
             raw_input, noise_profile_wav,
@@ -264,7 +318,10 @@ def main(config_path):
     # throughout instead of showing your real (possibly messy) room.
     bg_cfg = cfg.get("background", {})
     background_image = None
-    if bg_cfg.get("enabled", False):
+    # BACKGROUND_REMOVE in .env overrides config.yaml's background.enabled
+    # when set, so a run can flip this per-machine without editing config.yaml.
+    bg_enabled = env_flag("BACKGROUND_REMOVE", default=bg_cfg.get("enabled", False))
+    if bg_enabled:
         accent_hex = bg_cfg.get("accent", "#2dd4bf").lstrip("#")
         accent_rgb = tuple(int(accent_hex[i:i + 2], 16) for i in (0, 2, 4))
         background_image = work_dir / "theme_background.png"
@@ -281,7 +338,8 @@ def main(config_path):
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [
             executor.submit(process_range, i, rng, raw_input, work_dir, cfg, mask_png, border_png,
-                             print_lock, noise_profile_wav=noise_profile_wav, background_image=background_image)
+                             print_lock, noise_profile_wav=noise_profile_wav, background_image=background_image,
+                             audio_editing_enabled=audio_editing_enabled)
             for i, rng in enumerate(plan)
         ]
         for future in as_completed(futures):
@@ -322,6 +380,19 @@ def main(config_path):
         "-c:a", render_cfg["audio_codec"], "-b:a", render_cfg["audio_bitrate"],
         str(final_path)
     ])
+
+    outro_cfg = cfg.get("outro", {})
+    if outro_cfg.get("enabled", False):
+        print("\n=== Outro: subscribe & like overlay ===")
+        outro_path = work_dir / "final_with_outro.mp4"
+        outro.apply_outro(
+            final_path, outro_path, work_dir / "outro",
+            duration_sec=outro_cfg.get("duration_sec", 4.0),
+            width=frame_w, height=frame_h, fps=fps,
+            accent=hex_to_rgb(bg_cfg.get("accent", "#2dd4bf")),
+            channel_name=outro_cfg.get("channel_name", ""),
+        )
+        final_path = outro_path
 
     shutil.copy(final_path, output_video)
     print(f"\nDone. Final file: {output_video.resolve()}")

@@ -40,11 +40,6 @@ from openai import OpenAI
 
 load_dotenv()
 
-client = OpenAI(
-    base_url="https://router.huggingface.co/v1",
-    api_key=os.getenv("HF_TOKEN"),
-)
-
 TRIGGER_PHRASES = [
     "the way this works", "here's how", "let me show you", "imagine",
     "think of it like", "think of it as", "for example", "basically what happens",
@@ -78,7 +73,13 @@ def heuristic_plan(transcript, min_gap_sec=8.0, graphic_duration_sec=15.0, max_s
 
     segments = []
     for m in merged[:max_segments]:
-        end = m["start"] + graphic_duration_sec
+        # A flat start+graphic_duration_sec window ignores how far a merge
+        # group actually spans -- several trigger phrases close together
+        # usually mean one continuous multi-part explanation, and capping
+        # it to the single-concept default duration would truncate the
+        # graphic before the explanation (and the transcript-timed step
+        # reveals within it) actually finishes.
+        end = max(m["start"] + graphic_duration_sec, m["end"])
         segments.append({
             "start": seconds_to_hms(m["start"]),
             "end": seconds_to_hms(end),
@@ -102,7 +103,7 @@ def seconds_to_hms(sec):
     return f"{h:02d}:{m:02d}:{s:05.2f}"
 
 
-def build_llm_system_prompt(max_segments):
+def build_llm_system_prompt(max_segments, min_gap_sec):
     return (
         "You edit educational YouTube videos. You'll be given a timestamped "
         "transcript. Identify up to "
@@ -110,13 +111,50 @@ def build_llm_system_prompt(max_segments):
         "that would genuinely be clearer with an animated motion graphic "
         "on screen (not every explanation needs one — pick the strongest "
         "candidates: multi-step processes, abstract mechanisms, comparisons, "
-        "data flows, architectures). For each, give a start/end timestamp "
-        "(end should be roughly 10-20 seconds after start, enough to cover "
-        "the explanation, not overlapping other picks) and a specific, "
-        "visual, one-sentence prompt describing the graphic to generate. "
+        "data flows, architectures).\n\n"
+        "If the speaker walks through several sequential sub-points as one "
+        "continuous explanation (a numbered list, 'first...second...third...', "
+        "a checklist, steps of a process), that is ONE pick covering the "
+        "whole span, with a single prompt that lists each sub-point in "
+        "order — never split a single ongoing list into multiple separate "
+        "picks. Splitting it produces a wall of back-to-back graphics with "
+        "no breathing room, which reads as chaotic, not a series of "
+        "distinct concepts.\n\n"
+        f"Leave at least {min_gap_sec:.0f} seconds of gap between the end of "
+        "one pick and the start of the next, so the video returns to the "
+        "presenter's full-frame camera between graphics instead of chaining "
+        "graphic after graphic. For each pick, give a start/end timestamp "
+        "(end should be roughly 10-20 seconds after start for a single "
+        "concept, longer for a consolidated multi-step list, enough to "
+        "cover the explanation, never overlapping another pick) and a "
+        "specific, visual prompt describing the graphic to generate — for "
+        "a multi-step list, enumerate the steps in the prompt in the exact "
+        "order they're spoken. "
         "Respond with ONLY a JSON array, no prose, no markdown fences: "
         '[{"start": 12.3, "end": 27.0, "prompt": "..."}]'
     )
+
+
+def _merge_close_picks(picks, min_gap_sec):
+    """
+    Code-level backstop for the min-gap/consolidation instructions in
+    build_llm_system_prompt: models vary in how well they follow "leave a
+    gap" and "don't split one list into multiple picks" instructions
+    (smaller/local models especially), so don't rely on the prompt alone —
+    merge any picks that end up close together anyway, unioning their time
+    range and concatenating their prompts. Same shape of fix as
+    heuristic_plan's own nearby-hit merge, applied to LLM output instead of
+    trigger-phrase hits.
+    """
+    picks = sorted(picks, key=lambda p: p["start"])
+    merged = []
+    for p in picks:
+        if merged and p["start"] - merged[-1]["end"] < min_gap_sec:
+            merged[-1]["end"] = max(merged[-1]["end"], p["end"])
+            merged[-1]["prompt"] = merged[-1]["prompt"].rstrip(". ") + "; then: " + p["prompt"]
+        else:
+            merged.append(dict(p))
+    return merged
 
 
 def parse_llm_json_picks(raw_text):
@@ -146,18 +184,29 @@ def picks_to_segments(picks):
     return segments
 
 
-def huggingface_plan(transcript, model="deepseek-ai/DeepSeek-V4-Flash:novita", max_segments=12):
+def huggingface_plan(transcript, model="deepseek-ai/DeepSeek-V4-Flash:novita", max_segments=12,
+                      min_gap_sec=6.0):
     """
     Sends the transcript to the Hugging Face router using the OpenAI-compatible
     client and asks it to pick moments that need a visual aid.
+
+    min_gap_sec is enforced twice: once as an instruction to the model, and
+    again in code via _merge_close_picks regardless of whether the model
+    actually followed it — see that function's docstring for why the prompt
+    alone isn't trusted to guarantee this.
     """
     if not os.getenv("HF_TOKEN"):
         raise RuntimeError("HF_TOKEN is not set. Add it to your environment or .env file.")
 
+    client = OpenAI(
+        base_url="https://router.huggingface.co/v1",
+        api_key=os.getenv("HF_TOKEN"),
+    )
+
     transcript_text = "\n".join(
         f"[{e['start']:.1f}-{e['end']:.1f}] {e['text']}" for e in transcript
     )
-    system = build_llm_system_prompt(max_segments)
+    system = build_llm_system_prompt(max_segments, min_gap_sec)
 
     completion = client.chat.completions.create(
         model=model,
@@ -168,6 +217,7 @@ def huggingface_plan(transcript, model="deepseek-ai/DeepSeek-V4-Flash:novita", m
     )
     raw = completion.choices[0].message.content
     picks = parse_llm_json_picks(raw)
+    picks = _merge_close_picks(picks, min_gap_sec)
     return picks_to_segments(picks)
 
 
@@ -191,6 +241,9 @@ def main():
                      help="model name override (default: deepseek-ai/DeepSeek-V4-Flash:novita)")
     ap.add_argument("--write", action="store_true", help="write results into config.yaml's segments list")
     ap.add_argument("--max-segments", type=int, default=12)
+    ap.add_argument("--min-gap-sec", type=float, default=None,
+                     help="minimum gap between consecutive graphic picks, so they don't chain "
+                          "back-to-back with no return to camera (default: 6.0 for --llm, 8.0 heuristic)")
     args = ap.parse_args()
 
     transcript = json.loads(Path(args.transcript_json).read_text())
@@ -200,9 +253,13 @@ def main():
             transcript,
             model=args.model or "deepseek-ai/DeepSeek-V4-Flash:novita",
             max_segments=args.max_segments,
+            **({"min_gap_sec": args.min_gap_sec} if args.min_gap_sec is not None else {}),
         )
     else:
-        segments = heuristic_plan(transcript, max_segments=args.max_segments)
+        segments = heuristic_plan(
+            transcript, max_segments=args.max_segments,
+            **({"min_gap_sec": args.min_gap_sec} if args.min_gap_sec is not None else {}),
+        )
 
     print(f"\n{'='*60}\nProposed {len(segments)} graphic segment(s):\n{'='*60}")
     for s in segments:

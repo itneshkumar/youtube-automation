@@ -7,9 +7,16 @@ output_video: output/final_cut.mp4
 
 # How many talk/graphic ranges to process concurrently. Ranges are mostly
 # independent work, so this is the single biggest speed lever — try raising
-# it on a machine with more CPU cores, or lower it if ffmpeg/Ollama start
+# it on a machine with more CPU cores, or lower it if ffmpeg/llama-server start
 # contending too much. Defaults to min(4, cpu count) if omitted.
 parallel_workers: 4
+
+# Master switch for the whole audio-editing chain (silence cut + noise
+# reduction + loudness/EQ) across every range. Off means every range's raw
+# audio and original timing pass through untouched. AUDIO_EDITING=true/false
+# in .env overrides `enabled` below when set.
+audio_editing:
+  enabled: true
 
 silence:
   noise_floor_db: -30
@@ -46,6 +53,7 @@ pip:
 # for the whole video (talk/full-frame segments only — MediaPipe person
 # segmentation). Off by default since it adds real processing time and a
 # ~250KB model download on first use; set enabled: true to turn it on.
+# BACKGROUND_REMOVE=true/false in .env overrides `enabled` below when set.
 background:
   enabled: false
   accent: "#2dd4bf"
@@ -53,13 +61,25 @@ background:
   rim_glow_px: 3
 
 # Graphic segments are written by an LLM as animated HTML, then recorded by a
-# headless browser. backend: ollama (free, local, needs `ollama serve` +
-# a pulled model) or anthropic (better quality, needs ANTHROPIC_API_KEY).
+# headless browser. backend: llamacpp (free, local, needs a running
+# `llama-server` — address read from LLAMACPP_SERVER in .env), or anthropic
+# (best quality, needs ANTHROPIC_API_KEY).
 graphics:
-  backend: ollama
+  backend: llamacpp
   model: phi3.5
-  ollama_server: http://127.0.0.1:11434
   timeout_sec: 180
+  # Agentic retry budget: each attempt extracts steps, renders, then verifies
+  # the actual output (step-list quality, then render duration/integrity) —
+  # a failing attempt's problems feed back into the next attempt instead of
+  # silently handing the pipeline a bad step list or a truncated clip.
+  max_attempts: 2
+
+# Animated "subscribe & like" pop-in, overlaid on the last duration_sec
+# seconds of the final render (doesn't extend the video, just overlays it).
+outro:
+  enabled: false
+  duration_sec: 4.0
+  channel_name: ''   # optional, shown as "Subscribe to <channel_name>"
 
 # Auto-filled by plan_segments.py --write (see README step 3), or hand-write
 # your own. Timestamps refer to your ORIGINAL, uncut recording.

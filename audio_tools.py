@@ -216,9 +216,20 @@ def reduce_noise(input_path, output_path, work_dir, noise_profile_wav=None,
     reduced = nr.reduce_noise(y=audio, sr=sr, y_noise=noise_clip, stationary=True)
     sf.write(clean_wav, reduced, sr)
 
+    # noisereduce doesn't guarantee sample-exact output length -- when
+    # clean_wav comes out shorter than the video, -shortest alone will trim
+    # copied VIDEO PACKETS to match (verified: dropped 4 real frames off an
+    # 88-frame range here), not just pad silence. That's actual visual
+    # content going missing near cuts, worse than an audio timing issue and
+    # a likely bigger contributor to visible lip-sync drift than a few ms of
+    # padding. apad makes the audio stream effectively unbounded, so
+    # -shortest can only ever be limited by the untouched, stream-copied
+    # video -- audio gets trimmed/padded to match video exactly, and video
+    # frames are never at risk of being cut.
     run([
         "ffmpeg", "-y", "-i", str(input_path), "-i", str(clean_wav),
         "-map", "0:v:0", "-map", "1:a:0",
+        "-af", "apad",
         "-c:v", "copy", "-c:a", "pcm_s16le",
         "-shortest",
         str(output_path)
@@ -227,12 +238,32 @@ def reduce_noise(input_path, output_path, work_dir, noise_profile_wav=None,
 
 
 def enhance_audio(input_path, output_path, highpass_hz, presence_boost_db, target_lufs, limiter_ceiling_db):
-    """Highpass rumble -> presence boost -> loudness normalize -> ceiling limiter."""
+    """
+    Highpass rumble -> presence boost -> loudness normalize -> ceiling limiter.
+
+    Single-pass loudnorm doesn't guarantee sample-exact output length --
+    measured ~67ms of audio shrinkage on a real 20s range here, with
+    nothing downstream correcting it (unlike reduce_noise, which realigns
+    via -shortest). Since this same chain runs on every talk AND graphic
+    range, that per-range deficit compounds across the final concat and is
+    what actually causes progressive lip-sync drift over a long video, not
+    any single big desync.
+
+    apad=whole_dur+atrim (filter-level, sample-accurate) rather than a
+    global -t flag: -t alone measurably left audio short by up to ~85ms on
+    real ranges here, because AAC encodes in fixed 1024-sample blocks and
+    can't emit a partial trailing frame at an arbitrary cutoff -- it just
+    drops it, silently re-introducing the same kind of shortfall this
+    function exists to fix. Trimming in the filter graph, before encoding,
+    doesn't have that problem.
+    """
+    duration = probe_duration(input_path)
     af = (
         f"highpass=f={highpass_hz},"
         f"equalizer=f=3000:t=q:w=1:g={presence_boost_db},"
         f"loudnorm=I={target_lufs}:TP={limiter_ceiling_db}:LRA=11,"
-        f"alimiter=limit={_db_to_linear(limiter_ceiling_db):.6f}"
+        f"alimiter=limit={_db_to_linear(limiter_ceiling_db):.6f},"
+        f"apad=whole_dur={duration:.6f},atrim=end={duration:.6f},asetpts=PTS-STARTPTS"
     )
     run([
         "ffmpeg", "-y", "-i", str(input_path),

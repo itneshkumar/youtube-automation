@@ -11,6 +11,7 @@ venv/
 
 # Local config (use config.example.yaml as template)
 config.yaml
+.env
 
 # Generated / working data
 output/

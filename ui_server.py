@@ -9,16 +9,22 @@ nothing is exposed outside your machine. Edit settings, hit Save, or hit
 Run to save + kick off start.sh and watch its output live in the page.
 """
 
+import html
 import json
+import os
 import re
 import subprocess
 import sys
 import threading
+import urllib.error
+import urllib.request
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import yaml
+
+import transcribe
 
 ANSI_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
 
@@ -27,6 +33,7 @@ CONFIG_PATH = PROJECT_DIR / "config.yaml"
 CONFIG_EXAMPLE_PATH = PROJECT_DIR / "config.example.yaml"
 LOG_PATH = PROJECT_DIR / "work" / "ui_run.log"
 PORT = 8787
+DEFAULT_LLAMACPP_SERVER = os.environ.get("LLAMACPP_SERVER", "http://127.0.0.1:8480")
 
 # (form field name, path into the config dict, type)
 FIELD_SPECS = [
@@ -53,16 +60,50 @@ FIELD_SPECS = [
     ("pip_border_width_px", ("pip", "border_width_px"), int),
     ("graphics_backend", ("graphics", "backend"), str),
     ("graphics_model", ("graphics", "model"), str),
-    ("graphics_ollama_server", ("graphics", "ollama_server"), str),
     ("graphics_timeout_sec", ("graphics", "timeout_sec"), int),
     ("background_enabled", ("background", "enabled"), bool),
     ("background_accent", ("background", "accent"), str),
     ("background_feather_px", ("background", "feather_px"), int),
     ("background_rim_glow_px", ("background", "rim_glow_px"), int),
+    ("outro_enabled", ("outro", "enabled"), bool),
+    ("outro_duration_sec", ("outro", "duration_sec"), float),
+    ("outro_channel_name", ("outro", "channel_name"), str),
 ]
 
 RUN_LOCK = threading.Lock()
 RUN_STATE = {"proc": None}
+
+# Tracks background whisper.cpp model downloads kicked off from the UI, keyed
+# by model size, so /whisper_model_status can report live progress instead of
+# the download just happening silently mid-run the first time a size is used.
+DOWNLOAD_LOCK = threading.Lock()
+DOWNLOAD_STATE = {}
+
+
+def start_model_download(model_size):
+    with DOWNLOAD_LOCK:
+        state = DOWNLOAD_STATE.get(model_size)
+        if state and state.get("active"):
+            return False, "Already downloading."
+        DOWNLOAD_STATE[model_size] = {"active": True, "downloaded": 0, "total": 0, "error": None}
+
+    def progress_cb(downloaded, total):
+        with DOWNLOAD_LOCK:
+            DOWNLOAD_STATE[model_size]["downloaded"] = downloaded
+            DOWNLOAD_STATE[model_size]["total"] = total
+
+    def run():
+        try:
+            transcribe.download_whispercpp_model(model_size, progress_cb=progress_cb)
+        except Exception as exc:
+            with DOWNLOAD_LOCK:
+                DOWNLOAD_STATE[model_size]["error"] = str(exc)
+        finally:
+            with DOWNLOAD_LOCK:
+                DOWNLOAD_STATE[model_size]["active"] = False
+
+    threading.Thread(target=run, daemon=True).start()
+    return True, "Download started."
 
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".m4v", ".webm", ".mts", ".m2ts"}
 
@@ -210,8 +251,21 @@ def run_status():
     return "idle", None
 
 
+def list_llamacpp_models(server):
+    """Model id(s) currently loaded in the running llama-server, for the
+    UI's model dropdown (OpenAI-compatible GET /v1/models). Empty list (not
+    an error) if it isn't reachable — the free-text field still works."""
+    try:
+        with urllib.request.urlopen(f"{server.rstrip('/')}/v1/models", timeout=1.5) as resp:
+            data = json.loads(resp.read())
+        return sorted(m["id"] for m in data.get("data", []))
+    except (urllib.error.URLError, OSError, ValueError, KeyError):
+        return []
+
+
 def render_form():
     cfg = load_config()
+    llamacpp_models = list_llamacpp_models(DEFAULT_LLAMACPP_SERVER)
 
     def v(path, default=""):
         val = get_nested(cfg, path)
@@ -337,13 +391,17 @@ def render_form():
       </div>
       <div class="field">
         <label>Whisper model</label>
-        <select name="whisper_model">
+        <select name="whisper_model" id="whisper_model">
           <option value="tiny">tiny</option>
           <option value="base">base</option>
           <option value="small" selected>small</option>
           <option value="medium">medium</option>
           <option value="large-v3">large-v3</option>
         </select>
+        <div style="display:flex; align-items:center; gap:.5rem;">
+          <span id="whisper-status" style="font-size:.78rem; color:light-dark(#666,#999);"></span>
+          <button type="button" id="whisper-download-btn" style="display:none; font-size:.78rem; padding:.3rem .6rem;">Download model</button>
+        </div>
       </div>
     </div>
   </fieldset>
@@ -447,17 +505,24 @@ def render_form():
       <div class="field">
         <label>Backend</label>
         <select name="graphics_backend">
-          <option value="ollama" {selected(('graphics','backend'),'ollama')}>ollama (free, local)</option>
+          <option value="llamacpp" {selected(('graphics','backend'),'llamacpp')}>llamacpp (free, local)</option>
           <option value="anthropic" {selected(('graphics','backend'),'anthropic')}>anthropic (paid, needs ANTHROPIC_API_KEY)</option>
         </select>
       </div>
       <div class="field">
         <label>Model</label>
-        <input name="graphics_model" value="{v(('graphics','model'), 'phi3.5')}" placeholder="phi3.5 or claude-opus-4-8">
+        <input name="graphics_model" id="graphics_model" value="{v(('graphics','model'), 'phi3.5')}" placeholder="phi3.5, claude-opus-4-8">
       </div>
       <div class="field">
-        <label>Ollama server</label>
-        <input name="graphics_ollama_server" value="{v(('graphics','ollama_server'), 'http://127.0.0.1:11434')}">
+        <label>Loaded llama.cpp models</label>
+        <select onchange="if(this.value) document.getElementById('graphics_model').value=this.value;">
+          <option value="">{'— none found, is `llama-server` running? —' if not llamacpp_models else '— pick to fill Model —'}</option>
+          {''.join(f'<option value="{html.escape(m)}">{html.escape(m)}</option>' for m in llamacpp_models)}
+        </select>
+      </div>
+      <div class="field">
+        <label>llama.cpp server (from .env)</label>
+        <input value="{html.escape(DEFAULT_LLAMACPP_SERVER)}" disabled>
       </div>
       <div class="field">
         <label>Timeout (sec)</label>
@@ -487,6 +552,27 @@ def render_form():
       <div class="field">
         <label>Rim border width (px, 0 = off)</label>
         <input type="number" name="background_rim_glow_px" value="{v(('background','rim_glow_px'), 3)}">
+      </div>
+    </div>
+  </fieldset>
+
+  <fieldset>
+    <legend>Outro</legend>
+    <div class="row">
+      <div class="field wide">
+        <label>Animated "subscribe & like" pop-in, overlaid on the last few seconds of the final render — doesn't extend the video, just plays on top of the existing ending.</label>
+      </div>
+      <div class="field checkline">
+        <input type="checkbox" id="outro_enabled" name="outro_enabled" {checked(('outro','enabled'))}>
+        <label for="outro_enabled">Enabled</label>
+      </div>
+      <div class="field">
+        <label>Duration (sec)</label>
+        <input type="number" step="0.5" name="outro_duration_sec" value="{v(('outro','duration_sec'), 4.0)}">
+      </div>
+      <div class="field">
+        <label>Channel name (optional)</label>
+        <input name="outro_channel_name" value="{v(('outro','channel_name'), '')}" placeholder="shown as \"Subscribe to &lt;name&gt;\"">
       </div>
     </div>
   </fieldset>
@@ -597,6 +683,51 @@ async function pollLog() {{
 
 // Resume polling if a run is already in progress when the page loads.
 pollLog();
+
+// --- Whisper model download status ---
+const whisperSelect = document.getElementById('whisper_model');
+const whisperStatus = document.getElementById('whisper-status');
+const whisperDownloadBtn = document.getElementById('whisper-download-btn');
+let whisperPoller = null;
+
+function formatMB(bytes) {{ return (bytes / (1024 * 1024)).toFixed(0) + 'MB'; }}
+
+async function checkWhisperModel() {{
+  const size = whisperSelect.value;
+  const res = await fetch('/whisper_model_status?size=' + encodeURIComponent(size));
+  const j = await res.json();
+  const p = j.progress || {{}};
+
+  if (j.cached) {{
+    whisperStatus.textContent = '✓ downloaded';
+    whisperDownloadBtn.style.display = 'none';
+    if (whisperPoller) {{ clearInterval(whisperPoller); whisperPoller = null; }}
+  }} else if (p.active) {{
+    const pct = p.total ? Math.round(100 * p.downloaded / p.total) : 0;
+    whisperStatus.textContent = 'downloading… ' + pct + '% (' + formatMB(p.downloaded) + (p.total ? ' / ' + formatMB(p.total) : '') + ')';
+    whisperDownloadBtn.style.display = 'none';
+    if (!whisperPoller) whisperPoller = setInterval(checkWhisperModel, 1000);
+  }} else if (p.error) {{
+    whisperStatus.textContent = 'download failed: ' + p.error;
+    whisperDownloadBtn.style.display = 'inline-block';
+    if (whisperPoller) {{ clearInterval(whisperPoller); whisperPoller = null; }}
+  }} else {{
+    whisperStatus.textContent = 'not downloaded';
+    whisperDownloadBtn.style.display = 'inline-block';
+    if (whisperPoller) {{ clearInterval(whisperPoller); whisperPoller = null; }}
+  }}
+}}
+
+whisperDownloadBtn.onclick = async () => {{
+  whisperDownloadBtn.style.display = 'none';
+  whisperStatus.textContent = 'starting download…';
+  await fetch('/download_whisper_model', {{ method: 'POST', body: JSON.stringify({{ size: whisperSelect.value }}) }});
+  whisperPoller = setInterval(checkWhisperModel, 1000);
+  checkWhisperModel();
+}};
+
+whisperSelect.onchange = checkWhisperModel;
+checkWhisperModel();
 
 // --- File browser modal ---
 const browseModal = document.getElementById('browse-modal');
@@ -712,6 +843,16 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"content": content, "offset": new_offset, "state": state, "returncode": rc})
             return
 
+        if self.path.startswith("/whisper_model_status"):
+            from urllib.parse import urlparse, parse_qs
+            qs = parse_qs(urlparse(self.path).query)
+            size = qs.get("size", ["small"])[0]
+            cached = transcribe.find_cached_whispercpp_model(size) is not None
+            with DOWNLOAD_LOCK:
+                progress = dict(DOWNLOAD_STATE.get(size, {}))
+            self._send_json({"cached": cached, "progress": progress})
+            return
+
         if self.path.startswith("/browse"):
             from urllib.parse import urlparse, parse_qs
             qs = parse_qs(urlparse(self.path).query)
@@ -749,6 +890,13 @@ class Handler(BaseHTTPRequestHandler):
 
         if self.path == "/stop":
             ok, message = stop_run()
+            self._send_json({"ok": ok, "message": message})
+            return
+
+        if self.path == "/download_whisper_model":
+            fields = self._read_json_body()
+            size = fields.get("size") or "small"
+            ok, message = start_model_download(size)
             self._send_json({"ok": ok, "message": message})
             return
 
